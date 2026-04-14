@@ -45,12 +45,13 @@ function checkAllReady(io, code) {
       if (roomState[code]) {
         roomState[code].playbackActive = false;
       }
-    }, SYNC_BUFFER_MS + 1000);
+    }, SYNC_BUFFER_MS + 1500);
   }
 }
 
 module.exports = function initSocket(io) {
   io.on('connection', (socket) => {
+
     socket.on('time-sync', ({ clientSentAt }) => {
       socket.emit('time-sync-response', {
         clientSentAt,
