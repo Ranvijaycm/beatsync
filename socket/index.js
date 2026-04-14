@@ -45,7 +45,7 @@ function checkAllReady(io, code) {
       if (roomState[code]) {
         roomState[code].playbackActive = false;
       }
-    }, SYNC_BUFFER_MS + 1700);
+    }, SYNC_BUFFER_MS + 1300);
   }
 }
 
