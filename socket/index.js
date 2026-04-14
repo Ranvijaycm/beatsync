@@ -1,56 +1,70 @@
 const db = require('../config/db');
 
 // roomState[code] = {
-//   hostSocketId:   string | null,
-//   members:        Map<socketId, { userId, username }>,
-//   readySet:       Set<socketId>,          // for initial autoplay only
-//   currentTrackId: number | null,
-//   countdownActive: boolean                // kept for device-ready autoplay path
+//   hostSocketId:    string | null,
+//   hostUserId:      number | null,
+//   members:         Map<socketId, { userId, username }>   — keyed by socketId
+//   userSockets:     Map<userId, socketId>                 — reverse lookup, one socket per user
+//   readyUserIds:    Set<userId>                           — tracks who is ready by userId
+//   currentTrackId:  number | null,
+//   playbackActive:  boolean    — true while a track is playing (suppresses re-trigger)
 // }
 const roomState = {};
 
 function getState(code) {
   if (!roomState[code]) {
     roomState[code] = {
-      hostSocketId:    null,
-      members:         new Map(),
-      readySet:        new Set(),
-      currentTrackId:  null,
-      countdownActive: false,
+      hostSocketId:   null,
+      hostUserId:     null,
+      members:        new Map(),   // socketId → { userId, username }
+      userSockets:    new Map(),   // userId   → socketId  (latest socket for that user)
+      readyUserIds:   new Set(),   // userId   → ready
+      currentTrackId: null,
+      playbackActive: false,
     };
   }
   return roomState[code];
 }
 
-// ─── NTP-style sync helper ────────────────────────────────────────────────────
-// Called in two situations:
-//   1. Host explicitly picks a track  (via 'play-track')
-//   2. All devices signal ready       (via 'device-ready', for initial autoplay)
-//
-// Sends { trackId, startAt } where startAt is an absolute Unix epoch-ms
-// timestamp that is SYNC_BUFFER_MS in the future.  Every device schedules
-// MediaPlayer.start() at exactly that moment via handler.postDelayed(delta).
-// No 3-2-1 countdown — just silent, precise, wall-clock scheduling.
-//
-// 1500 ms is enough for:
-//   • Android to call prepare() on a cached local file   (~5 ms)
-//   • postDelayed scheduling jitter                       (~10 ms)
-//   • Network RTT for the socket event to reach clients  (~50-300 ms)
-// BeatSync.gg uses the same technique (epoch timestamp + client-side scheduling).
+// Unique human participants = number of entries in userSockets
+function participantCount(s) {
+  return s.userSockets.size;
+}
+
+// ── NTP broadcast ─────────────────────────────────────────────────────────────
 const SYNC_BUFFER_MS = 1500;
 
 function broadcastPlay(io, code, trackId) {
   const startAt = Date.now() + SYNC_BUFFER_MS;
+  console.log(`[${code}] start-playback trackId=${trackId} startAt=${startAt}`);
   io.to(code).emit('start-playback', { trackId, startAt });
 }
 
+// ── Check if all unique users are ready ───────────────────────────────────────
+function checkAllReady(io, code) {
+  const s = getState(code);
+  const total = participantCount(s);
+  if (total === 0 || s.playbackActive || !s.currentTrackId) return;
+
+  console.log(`[${code}] ready ${s.readyUserIds.size}/${total}`);
+
+  if (s.readyUserIds.size >= total) {
+    s.playbackActive = true;
+    broadcastPlay(io, code, s.currentTrackId);
+    // Reset after buffer so future track changes can trigger again
+    setTimeout(() => { if (roomState[code]) roomState[code].playbackActive = false; }, SYNC_BUFFER_MS + 1000);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 module.exports = function initSocket(io) {
   io.on('connection', (socket) => {
 
     // ── join-room ─────────────────────────────────────────────────────────────
     socket.on('join-room', async ({ roomCode, userId, username }) => {
       const code = roomCode?.toUpperCase();
-      if (!code) return;
+      if (!code || !userId) return;
+
       try {
         const [rows] = await db.query(
           'SELECT * FROM rooms WHERE code = ? AND is_active = TRUE', [code]
@@ -60,15 +74,34 @@ module.exports = function initSocket(io) {
           return;
         }
 
+        const s = getState(code);
+
+        // ── Handle reconnect: same userId joining again ────────────────────
+        // Remove old socket entry for this userId before adding the new one
+        const oldSocketId = s.userSockets.get(userId);
+        if (oldSocketId && oldSocketId !== socket.id) {
+          s.members.delete(oldSocketId);
+          // Keep readyUserIds entry — user was already ready before reconnect
+          console.log(`[${code}] user ${userId} reconnected (old: ${oldSocketId} new: ${socket.id})`);
+        }
+
         socket.join(code);
         socket.data = { roomCode: code, userId, username };
 
-        const s = getState(code);
         s.members.set(socket.id, { userId, username });
-        if (rows[0].created_by === parseInt(userId)) s.hostSocketId = socket.id;
+        s.userSockets.set(userId, socket.id);   // always overwrite with latest socket
 
-        socket.emit('room-joined', { success: true, listenerCount: s.members.size });
-        socket.to(code).emit('listener-joined', { listenerCount: s.members.size, username });
+        // Mark host
+        if (rows[0].created_by === parseInt(userId)) {
+          s.hostSocketId = socket.id;
+          s.hostUserId   = userId;
+        }
+
+        const count = participantCount(s);
+        socket.emit('room-joined', { success: true, listenerCount: count });
+        socket.to(code).emit('listener-joined', { listenerCount: count, username });
+
+        console.log(`[${code}] joined userId=${userId} total=${count}`);
       } catch (e) { console.error('join-room', e); }
     });
 
@@ -94,59 +127,50 @@ module.exports = function initSocket(io) {
     });
 
     // ── track-uploaded ────────────────────────────────────────────────────────
-    // Broadcast new track to all room members so they can start downloading it.
     socket.on('track-uploaded', ({ roomCode, trackId, fileUrl, trackName, addedBy }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
       const s = getState(code);
 
-      // Only update currentTrackId if nothing is playing yet (first track in room)
+      // Only set currentTrackId if nothing is playing yet (first track in room)
       if (!s.currentTrackId) {
         s.currentTrackId = trackId;
-        s.readySet.clear();
-        s.countdownActive = false;
+        s.readyUserIds.clear();
+        s.playbackActive = false;
       }
 
       io.to(code).emit('track-available', { trackId, fileUrl, trackName, addedBy });
+      console.log(`[${code}] track-uploaded id=${trackId} current=${s.currentTrackId}`);
     });
 
     // ── device-ready ──────────────────────────────────────────────────────────
-    // Devices emit this after downloading the FIRST track (initial autoplay path).
-    // When ALL members are ready, trigger NTP sync immediately — no countdown.
+    // Client emits after downloading + caching the first track.
+    // Tracked by userId so reconnects don't break the count.
     socket.on('device-ready', ({ roomCode }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
-      const s = getState(code);
-      s.readySet.add(socket.id);
+      const s  = getState(code);
+      const uid = socket.data?.userId;
+      if (!uid) return;
 
-      const allReady = s.readySet.size >= s.members.size && s.members.size > 0;
-      if (allReady && !s.countdownActive && s.currentTrackId) {
-        s.countdownActive = true;   // prevent double-fire
-        broadcastPlay(io, code, s.currentTrackId);
-        // Reset flag after the buffer window so future device-ready events work
-        setTimeout(() => { s.countdownActive = false; }, SYNC_BUFFER_MS + 500);
-      }
+      s.readyUserIds.add(uid);
+      console.log(`[${code}] device-ready uid=${uid} ${s.readyUserIds.size}/${participantCount(s)}`);
+      checkAllReady(io, code);
     });
 
     // ── play-track ────────────────────────────────────────────────────────────
-    // Host explicitly picks a track (next / prev / queue tap / after track ends).
-    // Immediately broadcast NTP-synced start-playback to ALL devices — no waiting
-    // for device-ready, because the file should already be cached on every client.
+    // Host picks a track explicitly — immediately broadcast NTP-synced play.
     socket.on('play-track', ({ roomCode, trackId }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
       const s = getState(code);
       s.currentTrackId  = trackId;
-      s.readySet.clear();         // reset ready set for this new track
-      s.countdownActive = false;
+      s.readyUserIds.clear();
+      s.playbackActive  = false;
       broadcastPlay(io, code, trackId);
     });
 
     // ── track-ended ───────────────────────────────────────────────────────────
-    // Host's MediaPlayer fires onCompletion → host emits this.
-    // Mark current track played in DB; the host's RoomActivity then calls
-    // hostSwitchToIndex(next) which emits play-track — so we don't need to
-    // emit start-playback here again (avoid double-play).
     socket.on('track-ended', async ({ roomCode }) => {
       const code = roomCode?.toUpperCase();
       if (!code) return;
@@ -155,11 +179,11 @@ module.exports = function initSocket(io) {
         if (s.currentTrackId) {
           await db.query('UPDATE queue SET is_played = TRUE WHERE id = ?', [s.currentTrackId]);
         }
+        // Host's RoomActivity emits play-track next — no need to emit start-playback here
       } catch (e) { console.error('track-ended', e); }
     });
 
-    // ── playback controls (pause / resume / seek) ─────────────────────────────
-    // Relay host commands to all OTHER members only (socket.to = exclude sender).
+    // ── playback controls ─────────────────────────────────────────────────────
     socket.on('pause-track',  ({ roomCode, position }) =>
       socket.to(roomCode?.toUpperCase()).emit('playback-paused',  { position }));
     socket.on('resume-track', ({ roomCode, position }) =>
@@ -168,36 +192,65 @@ module.exports = function initSocket(io) {
       socket.to(roomCode?.toUpperCase()).emit('playback-seeked',  { position }));
 
     // ── leave / disconnect ────────────────────────────────────────────────────
-    socket.on('leave-room',  ({ roomCode }) => handleLeave(io, socket, roomCode?.toUpperCase()));
-    socket.on('disconnect',  ()            => {
-      if (socket.data?.roomCode) handleLeave(io, socket, socket.data.roomCode);
+    socket.on('leave-room',  ({ roomCode }) =>
+      handleLeave(io, socket, roomCode?.toUpperCase(), true));
+    socket.on('disconnect',  () => {
+      if (socket.data?.roomCode) handleLeave(io, socket, socket.data.roomCode, false);
     });
   });
 };
 
-// ─── handleLeave ─────────────────────────────────────────────────────────────
-async function handleLeave(io, socket, code) {
+// ─────────────────────────────────────────────────────────────────────────────
+// handleLeave
+//
+// intentional = true  → user tapped Leave (remove permanently right away)
+// intentional = false → socket dropped (minimize, network blip, file picker)
+//   We wait 8 seconds before treating it as a real leave, so the user can
+//   reconnect via onResume without being counted as having left.
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleLeave(io, socket, code, intentional) {
   if (!code || !roomState[code]) return;
   const s = roomState[code];
+  if (!s.members.has(socket.id)) return;  // already handled
 
-  // Guard: don't process the same socket twice (disconnect can fire after leave-room)
-  if (!s.members.has(socket.id)) return;
+  const member   = s.members.get(socket.id);
+  const userId   = member?.userId;
+  const username = member?.username;
 
-  const member = s.members.get(socket.id);
   s.members.delete(socket.id);
-  s.readySet.delete(socket.id);
   socket.leave(code);
 
-  if (s.hostSocketId === socket.id) {
-    // Host left → close the room
+  if (intentional) {
+    if (s.userSockets.get(userId) === socket.id) {
+      s.userSockets.delete(userId);
+      s.readyUserIds.delete(userId);
+    }
+    await emitLeaveEvent(io, s, code, userId, username);
+  } else {
+    // Give 8 seconds for reconnect before treating as permanent leave
+    setTimeout(async () => {
+      if (!roomState[code]) return;
+      if (s.userSockets.get(userId) === socket.id) {
+        // User never reconnected with a new socket — treat as permanent leave
+        s.userSockets.delete(userId);
+        s.readyUserIds.delete(userId);
+        console.log(`[${code}] userId=${userId} did not reconnect — removing`);
+        await emitLeaveEvent(io, s, code, userId, username);
+      }
+      // else: user came back with a new socket — do nothing
+    }, 8000);
+  }
+}
+
+async function emitLeaveEvent(io, s, code, userId, username) {
+  if (s.hostUserId === userId) {
     try { await db.query('UPDATE rooms SET is_active = FALSE WHERE code = ?', [code]); } catch {}
     io.to(code).emit('host-left', { message: 'Host left. Room closed.' });
     delete roomState[code];
+    console.log(`[${code}] host left, room closed`);
   } else {
-    // Regular listener left
-    io.to(code).emit('listener-left', {
-      listenerCount: s.members.size,
-      username:      member?.username,
-    });
+    const count = participantCount(s);
+    io.to(code).emit('listener-left', { listenerCount: count, username });
+    console.log(`[${code}] listener left userId=${userId} remaining=${count}`);
   }
 }
